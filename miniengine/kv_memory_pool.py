@@ -94,6 +94,11 @@ class KVMemoryPool:
         return len(self._free)
 
     @property
+    def num_pages(self) -> int:
+        """Total number of pages in the pool."""
+        return self._num_pages
+
+    @property
     def kv_caches(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Per-layer (K, V) cache tensors.
 
@@ -121,6 +126,11 @@ class KVMemoryPool:
         bytes_per_page_all_layers = num_layers * 2 * bytes_one_kv_plane
 
         num_pages = int(bytes_budget // bytes_per_page_all_layers)
+        if num_pages < 1:
+            raise ValueError(
+                f"KV bytes_budget={bytes_budget} too small for one page "
+                f"(need ~{bytes_per_page_all_layers} bytes/page across layers)"
+            )
 
         return cls(
             num_pages=num_pages,

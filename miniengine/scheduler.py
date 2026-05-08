@@ -61,6 +61,9 @@ class Scheduler:
         self.total_finished: int = 0
         self.total_generated_tokens: int = 0
 
+        # Throttle KV-capacity warnings in paged mode.
+        self._kv_admission_warn_time: float = 0.0
+
     # ── Public API (thread-safe) ────────────────────────────────────────
 
     def add_request(self, request: Request) -> None:
@@ -193,6 +196,20 @@ class Scheduler:
             while (
                 self.waiting and len(self.running) + len(to_prefill) < self.max_running
             ):
+                cand = self.waiting[0]
+                if not self.engine.paged_kv_can_admit(
+                    self.running + to_prefill, cand
+                ):
+                    now = time.time()
+                    if now - self._kv_admission_warn_time > 30.0:
+                        self._kv_admission_warn_time = now
+                        logger.warning(
+                            "KV pool cannot admit more requests (%d waiting). "
+                            "Raise --mem-fraction-static, lower --max-running, "
+                            "or use a larger --page-size.",
+                            len(self.waiting),
+                        )
+                    break
                 to_prefill.append(self.waiting.popleft())
 
         if to_prefill:

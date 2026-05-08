@@ -15,6 +15,7 @@ import torch
 import uvicorn
 
 from miniengine.engine import Engine
+from miniengine.model import FLASH_ATTN_AVAILABLE
 from miniengine.scheduler import Scheduler
 from miniengine import server as srv
 
@@ -61,18 +62,51 @@ def parse_args() -> argparse.Namespace:
         "--mem-fraction-static",
         type=float,
         default=0.85,
-        help="Fraction of total GPU memory used as static budget in paged mode",
+        help="In paged mode: fraction of GPU memory still free *after* weights load "
+        "reserved for the KV pool (not a fraction of total VRAM)",
     )
     p.add_argument(
         "--kv-pool-pages",
         type=int,
         default=4096,
-        help="Fallback fixed KV pool pages when budget derivation is unavailable",
+        help="Fixed KV pool capacity in pages, or fallback when VRAM budget is unavailable",
+    )
+    p.add_argument(
+        "--fixed-kv-pool-pages",
+        action="store_true",
+        help="In paged mode: size the KV pool from --kv-pool-pages only (ignore "
+        "--mem-fraction-static). Use for fair baseline vs torch.compile comparisons.",
     )
     p.add_argument(
         "--torch-compile",
         action="store_true",
         help="Enable torch.compile on stable model submodules",
+    )
+    p.add_argument(
+        "--torch-compile-target",
+        type=str,
+        default="mlp",
+        choices=["mlp", "block"],
+        help="Sub-region to compile when --torch-compile is set",
+    )
+    p.add_argument(
+        "--torch-compile-dynamic",
+        action="store_true",
+        help="Enable dynamic shape support for torch.compile regions",
+    )
+    p.add_argument(
+        "--require-flash-attn",
+        action="store_true",
+        help="In paged mode, fail startup if flash-attn is unavailable "
+        "(otherwise only warn)",
+    )
+    p.add_argument(
+        "--attention-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "flash_attn"],
+        help="Decode attention backend preference. "
+        "auto keeps current behavior.",
     )
     return p.parse_args()
 
@@ -101,20 +135,35 @@ def main() -> None:
 
     dtype = getattr(torch, args.dtype)
     logger.info(
-        "Initializing engine  model=%s  dtype=%s  mode=%s",
+        "Initializing engine  model=%s  dtype=%s  mode=%s  attention_backend=%s",
         args.model,
         args.dtype,
         args.mode,
+        args.attention_backend,
     )
 
-    kv_pool_bytes_budget = None
+    kv_pool_mem_fraction: float | None = None
     if args.mode == "paged":
-        total_mem = _cuda_total_memory_bytes(args.device)
-        if total_mem is not None:
-            kv_pool_bytes_budget = int(total_mem * args.mem_fraction_static)
+        if not FLASH_ATTN_AVAILABLE:
+            msg = (
+                "Paged mode requested but flash-attn is unavailable. "
+                "Benchmarks will run on a slower fallback path and can regress "
+                "throughput/latency. Install flash-attn for milestone-2 results."
+            )
+            if args.require_flash_attn:
+                raise SystemExit(msg)
+            logger.warning(msg)
+
+        if args.fixed_kv_pool_pages:
+            kv_pool_mem_fraction = None
             logger.info(
-                "Paged KV budget derived from mem fraction: %d bytes (fraction=%.3f)",
-                kv_pool_bytes_budget,
+                "Paged KV pool: fixed %d pages (--fixed-kv-pool-pages)",
+                args.kv_pool_pages,
+            )
+        elif _cuda_total_memory_bytes(args.device) is not None:
+            kv_pool_mem_fraction = args.mem_fraction_static
+            logger.info(
+                "Paged KV pool will use %.3f of free GPU memory after model load",
                 args.mem_fraction_static,
             )
         else:
@@ -122,7 +171,6 @@ def main() -> None:
                 "CUDA total memory unavailable; falling back to --kv-pool-pages=%d",
                 args.kv_pool_pages,
             )
-
     engine = Engine(
         model_path=args.model,
         dtype=dtype,
@@ -130,8 +178,11 @@ def main() -> None:
         mode=args.mode,
         page_size=args.page_size,
         kv_pool_num_pages=args.kv_pool_pages,
-        kv_pool_bytes_budget=kv_pool_bytes_budget,
+        kv_pool_mem_fraction=kv_pool_mem_fraction,
         torch_compile=args.torch_compile,
+        torch_compile_target=args.torch_compile_target,
+        torch_compile_dynamic=args.torch_compile_dynamic,
+        attention_backend=args.attention_backend,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 
