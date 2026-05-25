@@ -1103,7 +1103,10 @@ class Engine:
                 for _ in range(self.model.config.num_hidden_layers)
             ]
 
-        max_pages = self.kv_pool.pages_needed(max_cache_len)
+        max_pages = max(
+            self.kv_pool.pages_needed(max_cache_len),
+            max((len(self._paged_state(req).page_indices) for req in requests), default=0),
+        )
         page_table = torch.full(
             (batch_size, max_pages),
             fill_value=-1,
