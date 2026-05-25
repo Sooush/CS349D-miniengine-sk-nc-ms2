@@ -1,0 +1,188 @@
+% Milestone 2 benchmark results — paste into a larger report or compile standalone.
+% Build: pdflatex milestone2_results.tex
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+
+\captionsetup{font=small, labelfont=bf}
+
+\title{MiniEngine Milestone 2 --- Benchmark Results}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{Environment (fill in if needed.)}
+Model: \texttt{Qwen/Qwen3-8B}; GPU: L4 (per course instructions).
+Unless noted, paged runs use \texttt{--mem-fraction-static 0.85}.
+
+% ---------------------------------------------------------------------------
+\section{Accuracy (\texttt{bench\_accuracy} / MMLU)}
+
+\noindent Commands:
+\begin{verbatim}
+python -m miniengine --model Qwen/Qwen3-8B --mode batched
+
+python -m miniengine --model Qwen/Qwen3-8B --mode paged \
+  --mem-fraction-static 0.85 --page-size 256
+
+python -m miniengine --model Qwen/Qwen3-8B --mode paged \
+  --mem-fraction-static 0.85 --page-size 256 \
+  --torch-compile --torch-compile-target mlp
+\end{verbatim}
+
+\begin{table}[htbp]
+  \centering
+  \caption{MMLU accuracy (100 samples).}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Configuration & Accuracy & Correct / Samples & Avg latency \\
+    \midrule
+    Batched (Milestone~1 baseline) & 59.0\% & 59 / 100 & 2.07\,s \\
+    Paged (\texttt{page-size}=256) & 60.0\% & 60 / 100 & 1.74\,s \\
+    Paged + \texttt{torch.compile} (MLP) & 60.0\% & 60 / 100 & 1.55\,s \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{Throughput: batched baseline vs.\ paged}
+
+\noindent Benchmark:
+\begin{verbatim}
+python3 -m benchmark.bench_serving --input-len 512 --output-len 256 \
+  --concurrencies 1,4,8,16
+\end{verbatim}
+
+\noindent Engine (batched):
+\begin{verbatim}
+python -m miniengine --model Qwen/Qwen3-8B --mode batched
+\end{verbatim}
+
+\noindent Engine (paged):
+\begin{verbatim}
+python -m miniengine --model Qwen/Qwen3-8B --mode paged \
+  --mem-fraction-static 0.85 --page-size 256
+\end{verbatim}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Batched vs.\ paged \texttt{bench\_serving} (512 input / 256 output tokens). TTFT and completion in ms; TPOT in ms/token.}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{@{}rcccccccc@{}}
+    \toprule
+    Mode & Conc & TTFT$_{p50}$ & TTFT$_{p99}$ & Compl$_{p50}$ & Compl$_{p99}$ & TPOT$_{p50}$ & TPOT$_{p99}$ & GenTok/s \\
+    \midrule
+    \multirow{5}{*}{Batched}
+      &  1 & 220 & 542 & 14019 & 26129 & 70.8 & 111.3 & 13 \\
+      &  4 & 312 & 792 & 18126 & 22441 & 93.6 & 95.7 & 39 \\
+      &  8 & 336 & 1651 & 22274 & 29445 & 121.0 & 125.1 & 53 \\
+      & 16 & 396 & 3295 & 31251 & 45163 & 181.1 & 396.9 & 68 \\
+      & 32 & 20985 & 41631 & 59891 & 103175 & 231.0 & 425.4 & 72 \\
+    \midrule
+    \multirow{5}{*}{Paged}
+      &  1 & 221 & 976 & 13291 & 15817 & 66.8 & 67.0 & 15 \\
+      &  4 & 369 & 796 & 14726 & 17465 & 74.3 & 75.9 & 48 \\
+      &  8 & 384 & 1297 & 14845 & 19916 & 79.4 & 85.5 & 79 \\
+      & 16 & 311 & 2571 & 16516 & 23591 & 88.0 & 113.3 & 129 \\
+      & 32 & 10481 & 22769 & 29341 & 50076 & 117.0 & 294.0 & 151 \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{Throughput: paged vs.\ paged + \texttt{torch.compile}}
+
+\noindent Benchmark:
+\begin{verbatim}
+python3 -m benchmark.bench_serving --input-len 512 --output-len 256 \
+  --randomness 1.0 --concurrencies 8,16,32 --num-requests 64
+\end{verbatim}
+
+\noindent Engine (paged baseline):
+\begin{verbatim}
+python -m miniengine --model Qwen/Qwen3-8B --mode paged \
+  --mem-fraction-static 0.85 --page-size 256
+\end{verbatim}
+
+\noindent Engine (paged + compile):
+\begin{verbatim}
+python -m miniengine --model Qwen/Qwen3-8B --mode paged \
+  --mem-fraction-static 0.85 --page-size 256 \
+  --torch-compile --torch-compile-target mlp
+\end{verbatim}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Effect of \texttt{torch.compile} (MLP target) on paged serving.}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{@{}rcccccccc@{}}
+    \toprule
+    Configuration & Conc & TTFT$_{p50}$ & TTFT$_{p99}$ & Compl$_{p50}$ & Compl$_{p99}$ & TPOT$_{p50}$ & TPOT$_{p99}$ & GenTok/s \\
+    \midrule
+    \multirow{3}{*}{Paged}
+      &  8 & 346 & 3620 & 21762 & 23187 & 83.6 & 105.8 & 90 \\
+      & 16 & 2910 & 16273 & 24207 & 38861 & 89.8 & 100.4 & 136 \\
+      & 32 & 15699 & 35190 & 42104 & 77424 & 123.1 & 442.1 & 134 \\
+    \midrule
+    \multirow{3}{*}{\shortstack{Paged +\\ \texttt{torch.compile}}}
+      &  8 & 343 & 1646 & 21572 & 22298 & 83.4 & 105.4 & 91 \\
+      & 16 & 1908 & 3202 & 24891 & 25653 & 90.1 & 113.0 & 150 \\
+      & 32 & 12573 & 26922 & 37645 & 57951 & 119.5 & 429.7 & 152 \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{Page-size comparison}
+
+\noindent Benchmark (same as previous section):
+\begin{verbatim}
+python3 -m benchmark.bench_serving --input-len 512 --output-len 256 \
+  --randomness 1.0 --concurrencies 8,16,32 --num-requests 64
+\end{verbatim}
+
+\noindent Engines compared:
+\begin{verbatim}
+python -m miniengine --model Qwen/Qwen3-8B --mode paged \
+  --mem-fraction-static 0.85 --page-size 256
+
+python -m miniengine --model Qwen/Qwen3-8B --mode paged \
+  --mem-fraction-static 0.85 --page-size 1024
+\end{verbatim}
+
+\begin{table}[htbp]
+  \centering
+  \caption{\texttt{bench\_serving} for two KV page sizes.}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{@{}rcccccccc@{}}
+    \toprule
+    Page size & Conc & TTFT$_{p50}$ & TTFT$_{p99}$ & Compl$_{p50}$ & Compl$_{p99}$ & TPOT$_{p50}$ & TPOT$_{p99}$ & GenTok/s \\
+    \midrule
+    \multirow{3}{*}{256}
+      &  8 & 346 & 3620 & 21762 & 23187 & 83.6 & 105.8 & 90 \\
+      & 16 & 2910 & 16273 & 24207 & 38861 & 89.8 & 100.4 & 136 \\
+      & 32 & 15699 & 35190 & 42104 & 77424 & 123.1 & 442.1 & 134 \\
+    \midrule
+    \multirow{3}{*}{1024}
+      &  8 & 286 & 3179 & 15806 & 21383 & 82.9 & 86.5 & 90 \\
+      & 16 & 2711 & 11665 & 19794 & 32116 & 90.2 & 98.6 & 131 \\
+      & 32 & 14171 & 28943 & 33296 & 59648 & 119.9 & 304.6 & 130 \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+\paragraph{Comment.}
+Smaller pages (256) reduce wasted KV capacity at sequence tails but grow page-table metadata and indexing work; larger pages (1024) do the opposite.
+In this sweep, aggregate generation throughput (\textbf{GenTok/s}) is nearly identical at concurrency~8 (90 vs.\ 90); at concurrency~16 and~32, \textbf{page-size 256} yields higher throughput (136 vs.\ 131; 134 vs.\ 130), while \textbf{1024} shows lower median completion time at several points (e.g.\ Compl$_{p50}$ at conc.\ 8 and~32), reflecting a tradeoff between tail latency and sustained tokens/sec rather than a single ``always better'' setting.
+
+\end{document}
