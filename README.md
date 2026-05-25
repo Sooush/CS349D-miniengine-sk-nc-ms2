@@ -1,5 +1,7 @@
 # MiniEngine
 
+**Team repo (M2/M3):** [Sooush/CS349D-miniengine-sk-nc-ms2](https://github.com/Sooush/CS349D-miniengine-sk-nc-ms2) — push work here ([FORK.md](FORK.md)). Course starter: [stanford-mast/CS349D-miniengine](https://github.com/stanford-mast/CS349D-miniengine).
+
 A minimal LLM serving engine for educational purposes, inspired by [mini-sglang](https://github.com/sgl-project/mini-sglang).
 
 The engine serves an OpenAI-compatible API and is structured so that the **scheduler** is the primary optimization target across a series of assignments.

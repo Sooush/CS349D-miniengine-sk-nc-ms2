@@ -2,19 +2,11 @@
 CLI entry point — launch the MiniEngine server.
 
 Usage:
-    # Milestone 1 baseline
-    python -m miniengine --model Qwen/Qwen3-8B --mode batched
+    python -m miniengine --model Qwen/Qwen3-8B --mode paged \\
+        --mem-fraction-static 0.85 --page-size 32 --torch-compile
 
-    # Milestone 2: paged + torch.compile
-    python -m miniengine --model Qwen/Qwen3-8B \\
-        --mode paged --mem-fraction-static 0.85 \\
-        --page-size 32 --torch-compile
-
-    # Plus extra-credit CUDA graphs
-    python -m miniengine --model Qwen/Qwen3-8B \\
-        --mode paged --mem-fraction-static 0.85 \\
-        --page-size 32 --torch-compile \\
-        --cuda-graph --cuda-graph-batch-sizes 1,2,4,8,16,32
+    python -m miniengine --model Qwen/Qwen3-8B --mode paged \\
+        --mem-fraction-static 0.85 --page-size 32 --prefill-chunk-size 512
 """
 
 from __future__ import annotations
@@ -25,7 +17,8 @@ import logging
 import torch
 import uvicorn
 
-from miniengine.engine import Engine, ATTENTION_BACKENDS
+from miniengine.engine import Engine
+from miniengine.model import FLASH_ATTN_AVAILABLE
 from miniengine.scheduler import Scheduler
 from miniengine import server as srv
 
@@ -58,88 +51,92 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="paged",
         choices=["baseline", "batched", "paged"],
-        help="Scheduling mode: baseline (one request at a time), "
-        "batched (iteration-level batching, milestone 1), "
-        "or paged (paged KV + flash_attn varlen, milestone 2)",
+        help="Scheduling mode: baseline (one request at a time) or "
+        "batched (iteration-level batching, milestone 1) or "
+        "paged (milestone 2 paged KV path)",
     )
-
-    # ── Milestone-2 paged-mode flags ───────────────────────────────────
     p.add_argument(
         "--page-size",
         type=int,
-        default=256,
-        help="paged: tokens per KV page.  flashinfer (default backend) "
-        "works with any page size, including small ones (16, 32).  "
-        "flash_attn 2.x typically requires page_size %% 256 == 0.",
-    )
-    p.add_argument(
-        "--attention-backend",
-        type=str,
-        default="flashinfer",
-        choices=list(ATTENTION_BACKENDS),
-        help="paged: attention kernel backend.  flashinfer (default) "
-        "supports any page size and has a tensor-core decode kernel; "
-        "flash_attn varlen is battle-tested but requires "
-        "page_size %% 256 == 0 in standard builds.",
-    )
-    p.add_argument(
-        "--flashinfer-workspace-mb",
-        type=int,
-        default=128,
-        help="paged: scratch buffer size for flashinfer wrappers (MB)",
+        default=32,
+        help="Tokens per KV page (used in paged mode)",
     )
     p.add_argument(
         "--mem-fraction-static",
         type=float,
-        default=None,
-        help="paged: fraction of total GPU memory pre-allocated for static "
-        "tensors (model weights + KV pool).  Pool capacity is derived from "
-        "this; e.g. 0.85 leaves ~15%% for activations.",
+        default=0.85,
+        help="In paged mode: fraction of GPU memory still free *after* weights load "
+        "reserved for the KV pool (not a fraction of total VRAM)",
     )
     p.add_argument(
-        "--kv-pool-gb",
-        type=float,
-        default=None,
-        help="paged: explicit KV-pool size in GB (overrides --mem-fraction-static)",
-    )
-    p.add_argument(
-        "--activation-reserve-gb",
-        type=float,
-        default=4.0,
-        help="paged: fallback VRAM held back from the pool for forward "
-        "activations when neither --mem-fraction-static nor --kv-pool-gb "
-        "is set",
-    )
-    p.add_argument(
-        "--max-position",
+        "--kv-pool-pages",
         type=int,
-        default=16384,
-        help="paged: max RoPE position; cos/sin tables are sized at engine init",
+        default=4096,
+        help="Fixed KV pool capacity in pages, or fallback when VRAM budget is unavailable",
     )
-
-    # ── Milestone-2 accelerator flags (additive) ───────────────────────
+    p.add_argument(
+        "--fixed-kv-pool-pages",
+        action="store_true",
+        help="In paged mode: size the KV pool from --kv-pool-pages only (ignore "
+        "--mem-fraction-static). Use for fair baseline vs torch.compile comparisons.",
+    )
     p.add_argument(
         "--torch-compile",
         action="store_true",
-        help="Enable torch.compile on per-layer MLP and RMSNorm sub-modules",
+        help="Enable torch.compile on stable model submodules",
     )
     p.add_argument(
-        "--cuda-graph",
+        "--torch-compile-target",
+        type=str,
+        default="mlp",
+        choices=["mlp", "block"],
+        help="Sub-region to compile when --torch-compile is set",
+    )
+    p.add_argument(
+        "--torch-compile-dynamic",
         action="store_true",
-        help="Capture decode CUDA graphs at fixed batch sizes (requires --mode paged)",
+        help="Enable dynamic shape support for torch.compile regions",
     )
     p.add_argument(
-        "--cuda-graph-batch-sizes",
-        default="1,2,4,8,16,32",
-        help="paged: comma-separated bucket batch sizes to capture",
+        "--require-flash-attn",
+        action="store_true",
+        help="In paged mode, fail startup if flash-attn is unavailable "
+        "(otherwise only warn)",
     )
     p.add_argument(
-        "--cuda-graph-max-pages",
+        "--attention-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "flash_attn"],
+        help="Decode attention backend preference. "
+        "auto keeps current behavior.",
+    )
+
+    p.add_argument(
+        "--prefill-chunk-size",
         type=int,
-        default=32,
-        help="paged: max KV pages per sequence the captured graph supports",
+        default=0,
+        help="Per-step prefill token budget (0 = milestone-2 single-shot prefill)",
     )
+    p.add_argument(
+        "--disable-radix-cache",
+        action="store_true",
+        help="Disable the radix prefix cache (cache is on by default in paged mode)",
+    )
+
     return p.parse_args()
+
+
+def _cuda_total_memory_bytes(device: str) -> int | None:
+    if not torch.cuda.is_available():
+        return None
+    if not device.startswith("cuda"):
+        return None
+    if ":" in device:
+        device_idx = int(device.split(":")[1])
+    else:
+        device_idx = torch.cuda.current_device()
+    return int(torch.cuda.get_device_properties(device_idx).total_memory)
 
 
 def main() -> None:
@@ -154,36 +151,61 @@ def main() -> None:
 
     dtype = getattr(torch, args.dtype)
     logger.info(
-        "Initializing engine  model=%s  dtype=%s  mode=%s",
+        "Initializing engine  model=%s  dtype=%s  mode=%s  "
+        "attention_backend=%s  prefill_chunk_size=%d  radix_cache=%s",
         args.model,
         args.dtype,
         args.mode,
+        args.attention_backend,
+        args.prefill_chunk_size,
+        "off" if args.disable_radix_cache else "on",
     )
 
-    bs_list = (
-        [int(x) for x in args.cuda_graph_batch_sizes.split(",") if x.strip()]
-        if args.cuda_graph
-        else None
-    )
+    kv_pool_mem_fraction: float | None = None
+    if args.mode == "paged":
+        if not FLASH_ATTN_AVAILABLE:
+            msg = (
+                "Paged mode requested but flash-attn is unavailable. "
+                "Benchmarks will run on a slower fallback path and can regress "
+                "throughput/latency. Install flash-attn for milestone-2 results."
+            )
+            if args.require_flash_attn:
+                raise SystemExit(msg)
+            logger.warning(msg)
 
+        if args.fixed_kv_pool_pages:
+            kv_pool_mem_fraction = None
+            logger.info(
+                "Paged KV pool: fixed %d pages (--fixed-kv-pool-pages)",
+                args.kv_pool_pages,
+            )
+        elif _cuda_total_memory_bytes(args.device) is not None:
+            kv_pool_mem_fraction = args.mem_fraction_static
+            logger.info(
+                "Paged KV pool will use %.3f of free GPU memory after model load",
+                args.mem_fraction_static,
+            )
+        else:
+            logger.info(
+                "CUDA total memory unavailable; falling back to --kv-pool-pages=%d",
+                args.kv_pool_pages,
+            )
     engine = Engine(
         model_path=args.model,
         dtype=dtype,
         device=args.device,
         mode=args.mode,
-        torch_compile=args.torch_compile,
-        cuda_graph=args.cuda_graph,
         page_size=args.page_size,
-        mem_fraction_static=args.mem_fraction_static,
-        kv_pool_gb=args.kv_pool_gb,
-        activation_reserve_gb=args.activation_reserve_gb,
-        max_position=args.max_position,
-        cuda_graph_batch_sizes=bs_list,
-        cuda_graph_max_pages=args.cuda_graph_max_pages,
+        kv_pool_num_pages=args.kv_pool_pages,
+        kv_pool_mem_fraction=kv_pool_mem_fraction,
+        torch_compile=args.torch_compile,
+        torch_compile_target=args.torch_compile_target,
+        torch_compile_dynamic=args.torch_compile_dynamic,
         attention_backend=args.attention_backend,
-        flashinfer_workspace_mb=args.flashinfer_workspace_mb,
+        prefill_chunk_size=args.prefill_chunk_size,
+        disable_radix_cache=args.disable_radix_cache,
     )
-    sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
+    sched = Scheduler(engine=engine, max_running=args.max_running,mode=args.mode, prefill_chunk_size=args.prefill_chunk_size,)
 
     # Wire up the server module globals
     srv.engine = engine

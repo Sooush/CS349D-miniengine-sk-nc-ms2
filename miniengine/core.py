@@ -67,6 +67,9 @@ class Request:
     # cache effectiveness.
     cache_hit_tokens: int = 0
 
+    prefill_offset: int = 0
+    radix_lock_node: Any = None
+
     # ── Derived properties ─────────────────────────────────────────────
 
     @property
@@ -80,6 +83,11 @@ class Request:
     @property
     def is_finished(self) -> bool:
         return self.num_output_tokens >= self.sampling_params.max_new_tokens
+
+    @property
+    def prefill_done(self) -> bool:
+        """M3: True once every prompt token is in KV."""
+        return self.prefill_offset >= self.num_input_tokens
 
 
 @dataclass

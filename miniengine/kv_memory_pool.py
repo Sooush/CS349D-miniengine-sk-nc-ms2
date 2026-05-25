@@ -1,59 +1,41 @@
 """Pre-allocated paged KV cache memory pool — Milestone 2, Part A.
 
+This is a SKELETON. Implement the methods below.
+
 The pool owns a fixed amount of GPU memory, divided into equal-size
-**pages**.  Each page holds the KV state for `page_size` tokens for one
-layer.  Requests acquire pages as their KV grows and return them when
+**pages**. Each page holds the KV state for `page_size` tokens for one
+layer. Requests acquire pages as their KV grows and return them when
 they finish; the cache itself never reallocates.
 
-Storage layout
---------------
-Per layer we keep two tensors
+Storage layout (page-major vs token-major, contiguous K+V vs separate,
+shape conventions, etc.) is YOUR design decision — pick something and
+document the tradeoffs.
 
-    K, V  :  (num_pages, page_size, num_kv_heads, head_dim)
-
-i.e. page-major.  This shape was chosen because:
-
-* `flash_attn_varlen_func` (and `flash_attn_with_kvcache`) accepts a
-  *block table* whose entries are page indices into a tensor with this
-  exact layout (`(num_pages, page_size, num_kv_heads, head_dim)`),
-  so no reshape/transpose at the kernel boundary.
-* `view(-1, num_kv_heads, head_dim)` flattens the first two dims into a
-  global slot space, so a per-token `slot_mapping` (`page_idx * page_size
-  + offset`) writes directly into the right cell with `index_copy_`.
-
-Page 0 is reserved as a graph-padding scratch sink.  Under-full
-CUDA-graph batches address this page at distinct offsets so their
-throwaway K/V writes never clobber a real request's KV.
+Storage layout: page-major per layer. Each of K and V is shaped as
+(num_pages, page_size, num_kv_heads, head_dim).
 """
 
 from __future__ import annotations
 
-import logging
-import math
-
 import torch
-
-logger = logging.getLogger(__name__)
+import math
 
 
 class KVMemoryPool:
     """Pre-allocated paged KV cache pool.
 
     Args:
-        num_pages:    Total pages in the pool (capacity).  Page 0 is
-                      reserved as a CUDA-graph scratch sink, so the
-                      number of pages actually handed out is
-                      ``num_pages - 1``.
-        page_size:    Tokens per page.  Tunable knob — exposed as
-                      ``--page-size`` on the CLI.
+        num_pages:    Total pages in the pool (capacity).
+        page_size:    Tokens per page. Tunable knob — exposed as
+                      `--page-size` on the CLI. Smaller = less
+                      fragmentation, bigger page tables; larger = the
+                      opposite.
         num_layers:   Number of transformer layers.
         num_kv_heads: KV heads per layer (GQA).
         head_dim:     Per-head dimension.
         dtype:        KV dtype (typically bfloat16).
-        device:       e.g. ``"cuda"``.
+        device:       e.g. "cuda".
     """
-
-    SCRATCH_PAGE = 0  # never handed out — graph padding writes here
 
     def __init__(
         self,
@@ -65,12 +47,7 @@ class KVMemoryPool:
         dtype: torch.dtype,
         device: str,
     ) -> None:
-        if num_pages < 2:
-            raise ValueError(
-                f"KV pool needs at least 2 pages (1 scratch + 1 usable), got {num_pages}"
-            )
-
-        self.num_pages = num_pages
+        self._num_pages = num_pages
         self.page_size = page_size
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -78,80 +55,75 @@ class KVMemoryPool:
         self.dtype = dtype
         self.device = device
 
-        shape = (num_pages, page_size, num_kv_heads, head_dim)
-        self.k_caches = [
-            torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)
+        page_shape = (num_pages, page_size, num_kv_heads, head_dim)
+
+        self._k_caches = [
+            torch.zeros(page_shape, dtype=dtype, device=device)
+            for _ in range(num_layers)
         ]
-        self.v_caches = [
-            torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)
+        self._v_caches = [
+            torch.zeros(page_shape, dtype=dtype, device=device)
+            for _ in range(num_layers)
         ]
+        # Free list of physical pages.
+        self._free = list(range(num_pages))
+        self._radix_cache = None
 
-        # Free list: every page except the reserved scratch page.
-        self._free: list[int] = list(range(1, num_pages))
-
-        elem = torch.tensor([], dtype=dtype).element_size()
-        bytes_total = (
-            2 * num_layers * num_pages * page_size * num_kv_heads * head_dim * elem
-        )
-        logger.info(
-            "KVMemoryPool: %d pages × %d tokens (%.2f GB total, %d usable pages)",
-            num_pages,
-            page_size,
-            bytes_total / 1e9,
-            len(self._free),
-        )
-
-    # ── Allocation API ─────────────────────────────────────────────────
+    def set_radix_cache(self, cache) -> None:
+        """M3: wire prefix cache so allocate() can LRU-evict before OOM."""
+        self._radix_cache = cache
 
     def allocate(self, num_pages: int) -> list[int]:
-        """Reserve ``num_pages`` pages and return their indices.
+        """Reserve `num_pages` pages and return their indices.
 
-        Raises ``RuntimeError`` if the pool cannot satisfy the request.
+        Raises if the pool cannot satisfy the request.
         """
-        if num_pages < 0:
-            raise ValueError(f"num_pages must be non-negative, got {num_pages}")
         if num_pages == 0:
             return []
-        if len(self._free) < num_pages:
-            raise RuntimeError(
-                f"KV pool exhausted: requested {num_pages}, "
-                f"have {len(self._free)} free pages"
-            )
-        out = self._free[:num_pages]
-        self._free = self._free[num_pages:]
-        return out
+        if num_pages > len(self._free) and self._radix_cache is not None:
+            need = num_pages - len(self._free)
+            self._radix_cache.evict(need)
+
+        if num_pages > len(self._free):
+            raise RuntimeError(f"KV memory pool OOM: need {num_pages} pages, only {len(self._free)} free")
+
+        return [self._free.pop() for _ in range(num_pages)]
 
     def free(self, page_indices: list[int]) -> None:
         """Return the listed pages to the free pool."""
-        if not page_indices:
-            return
         self._free.extend(page_indices)
 
     def pages_needed(self, seq_len: int) -> int:
-        """How many pages are required to store ``seq_len`` tokens."""
-        if seq_len <= 0:
-            return 0
+        """How many pages are required to store `seq_len` tokens."""
         return math.ceil(seq_len / self.page_size)
-
-    # ── Introspection ──────────────────────────────────────────────────
 
     @property
     def num_free(self) -> int:
-        """Pages currently available for allocation (excludes scratch)."""
+        """Pages currently available for allocation."""
         return len(self._free)
 
     @property
+    def num_evictable(self) -> int:
+        """M3: pages the radix cache could evict (0 if cache disabled)."""
+        if self._radix_cache is None:
+            return 0
+        return self._radix_cache.num_evictable_pages()
+
+    @property
+    def num_pages(self) -> int:
+        """Total number of pages in the pool."""
+        return self._num_pages
+
+    @property
     def kv_caches(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Per-layer ``(K, V)`` cache tensors.
+        """Per-layer (K, V) cache tensors.
 
         The attention path holds references to these and indexes into
-        them via per-request page tables.  The shape is stable for the
-        whole lifetime of the pool: no reallocation, no resizing, no
-        swapping the tensors out after construction.
+        them via per-request page tables. The exact shape is up to your
+        design — but it must be STABLE: no reallocation, no resizing,
+        no swapping out the tensors after construction.
         """
-        return list(zip(self.k_caches, self.v_caches))
-
-    # ── Construction helpers ───────────────────────────────────────────
+        return list(zip(self._k_caches, self._v_caches))
 
     @classmethod
     def from_budget(
@@ -163,21 +135,21 @@ class KVMemoryPool:
         dtype: torch.dtype,
         device: str,
         bytes_budget: int,
-    ) -> "KVMemoryPool":
-        """Convenience: derive ``num_pages`` from a memory budget.
+    ) -> KVMemoryPool:
+        """Convenience: derive `num_pages` from a memory budget."""
+        bytes_per_element = torch.empty((), dtype=dtype, device=device).element_size()
+        bytes_one_kv_plane = page_size * num_kv_heads * head_dim * bytes_per_element
+        bytes_per_page_all_layers = num_layers * 2 * bytes_one_kv_plane
 
-        Picks the largest ``num_pages`` whose total K+V allocation fits
-        in ``bytes_budget``.  A floor of 16 pages is enforced so the
-        pool is always usable; if the budget is below that the caller
-        should bump it (or surface an OOM later).
-        """
-        elem = torch.tensor([], dtype=dtype).element_size()
-        bytes_per_page = (
-            2 * num_layers * num_kv_heads * page_size * head_dim * elem
-        )
-        num_pages = max(16, bytes_budget // bytes_per_page)
+        num_pages = int(bytes_budget // bytes_per_page_all_layers)
+        if num_pages < 1:
+            raise ValueError(
+                f"KV bytes_budget={bytes_budget} too small for one page "
+                f"(need ~{bytes_per_page_all_layers} bytes/page across layers)"
+            )
+
         return cls(
-            num_pages=int(num_pages),
+            num_pages=num_pages,
             page_size=page_size,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,

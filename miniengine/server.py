@@ -76,7 +76,12 @@ async def cache_stats():
     if cache is None:
         return {"enabled": False}
     m = cache.metrics
-    pool = engine.pool
+    pool = getattr(engine, "kv_pool", None) or getattr(engine, "pool", None)
+    num_cached = 0
+    try:
+        num_cached = cache.num_cached_pages
+    except NotImplementedError:
+        pass
     return {
         "enabled": True,
         "hit_rate": m.hit_rate,
@@ -85,7 +90,7 @@ async def cache_stats():
         "total_hit_tokens": m.total_hit_tokens,
         "total_inserted_pages": m.total_inserted_pages,
         "total_evicted_pages": m.total_evicted_pages,
-        "num_cached_pages": getattr(cache, "num_cached_pages", 0),
+        "num_cached_pages": num_cached,
         "pool_num_free": pool.num_free if pool is not None else 0,
         "pool_num_evictable": getattr(pool, "num_evictable", 0),
     }
