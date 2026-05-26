@@ -108,6 +108,11 @@ async def stream_chat(
     async with session.post(
         f"{base_url}/v1/chat/completions", json=payload
     ) as resp:
+        if resp.status != 200:
+            body = await resp.read()
+            raise RuntimeError(
+                f"HTTP {resp.status}: {body[:500]!r}"
+            )
         async for line in resp.content:
             s = line.decode().strip()
             if not s.startswith("data: "):
@@ -211,11 +216,21 @@ def build_synthetic_prompts(
     return out
 
 
+def _client_timeout(total_seconds: int) -> aiohttp.ClientTimeout:
+    """Long prefill on L4 can exceed 5 minutes before the first SSE chunk."""
+    return aiohttp.ClientTimeout(
+        total=total_seconds,
+        connect=60,
+        sock_read=total_seconds,
+    )
+
+
 async def workload_shared(
     base_url: str,
     prompts: list[PromptSpec],
     concurrency: int,
     max_tokens: int,
+    request_timeout: int,
 ) -> list[Sample]:
     """Run a list of pre-built prompt specs against the server.
 
@@ -227,6 +242,7 @@ async def workload_shared(
     for i, spec in enumerate(prompts):
         queue.put_nowait((i, spec))
     samples: list[Sample] = []
+    total = len(prompts)
 
     async def worker(session):
         while True:
@@ -253,9 +269,16 @@ async def workload_shared(
                     end_time=t_end,
                 )
             )
+            hit = usage.get("cache_hit_tokens", 0)
+            prompt_tok = usage.get("prompt_tokens", 0)
+            print(
+                f"    [{len(samples):>3}/{total}] group={spec.group_id} "
+                f"hit={hit}/{prompt_tok} ttft={(t_first - t_start)*1000:.0f}ms",
+                flush=True,
+            )
 
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=300),
+        timeout=_client_timeout(request_timeout),
     ) as session:
         workers = [asyncio.create_task(worker(session)) for _ in range(concurrency)]
         await asyncio.gather(*workers)
@@ -298,6 +321,7 @@ async def workload_multiturn(
     turns_per_session: int,
     concurrency: int,
     max_tokens: int,
+    request_timeout: int,
 ) -> list[Sample]:
     """N sessions of M turns each.  Sessions run concurrently; turns
     within a session are sequential because turn k's prompt embeds the
@@ -346,7 +370,7 @@ async def workload_multiturn(
                 messages.append({"role": "assistant", "content": text})
 
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=300),
+        timeout=_client_timeout(request_timeout),
     ) as session:
         workers = [
             asyncio.create_task(session_runner(session)) for _ in range(concurrency)
@@ -441,7 +465,13 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Cache effectiveness benchmark (shared prefix / multi-turn)",
     )
-    p.add_argument("--base-url", default="http://localhost:8001")
+    p.add_argument("--base-url", default="http://localhost:8000")
+    p.add_argument(
+        "--request-timeout",
+        type=int,
+        default=7200,
+        help="Per-request HTTP timeout in seconds (long shared-prefix prefills)",
+    )
     p.add_argument(
         "--workload",
         choices=["shared", "multiturn"],
@@ -504,6 +534,7 @@ def main() -> None:
         print(f"  Turns       : {args.turns_per_session}")
     print(f"  Concurrency : {args.concurrency}")
     print(f"  Max tokens  : {args.max_tokens}")
+    print(f"  Req timeout : {args.request_timeout}s")
 
     t0 = time.perf_counter()
     if args.workload == "shared":
@@ -520,6 +551,7 @@ def main() -> None:
                 prompts,
                 args.concurrency,
                 args.max_tokens,
+                args.request_timeout,
             )
         )
     else:  # multiturn
@@ -531,6 +563,7 @@ def main() -> None:
                 args.turns_per_session,
                 args.concurrency,
                 args.max_tokens,
+                args.request_timeout,
             )
         )
     wall_time = time.perf_counter() - t0
