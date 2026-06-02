@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
         default="paged",
         choices=["baseline", "batched", "paged"],
         help="Scheduling mode: baseline (one request at a time) or "
-        "batched (iteration-level batching, milestone 1) or "
-        "paged (milestone 2 paged KV path)",
+        "batched (iteration-level batching) or "
+        "paged (paged KV pool)",
     )
     p.add_argument(
         "--page-size",
@@ -116,12 +116,23 @@ def parse_args() -> argparse.Namespace:
         "--prefill-chunk-size",
         type=int,
         default=0,
-        help="Per-step prefill token budget (0 = milestone-2 single-shot prefill)",
+        help="Per-step prefill token budget (0 = single-shot prefill)",
     )
     p.add_argument(
         "--disable-radix-cache",
         action="store_true",
         help="Disable the radix prefix cache (cache is on by default in paged mode)",
+    )
+    p.add_argument(
+        "--cpu-cache-size-gb",
+        type=float,
+        default=0.0,
+        help="CPU DRAM KV tier size in GiB (0 = GPU-only radix cache)",
+    )
+    p.add_argument(
+        "--hicache-overlap",
+        action="store_true",
+        help="Use a dedicated CUDA stream for async HiCache demote/promote copies",
     )
 
     return p.parse_args()
@@ -167,7 +178,7 @@ def main() -> None:
             msg = (
                 "Paged mode requested but flash-attn is unavailable. "
                 "Benchmarks will run on a slower fallback path and can regress "
-                "throughput/latency. Install flash-attn for milestone-2 results."
+                "throughput/latency. Install flash-attn for best results."
             )
             if args.require_flash_attn:
                 raise SystemExit(msg)
@@ -204,6 +215,8 @@ def main() -> None:
         attention_backend=args.attention_backend,
         prefill_chunk_size=args.prefill_chunk_size,
         disable_radix_cache=args.disable_radix_cache,
+        cpu_cache_size_gb=args.cpu_cache_size_gb,
+        hicache_overlap=args.hicache_overlap,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running,mode=args.mode, prefill_chunk_size=args.prefill_chunk_size,)
 

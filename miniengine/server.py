@@ -69,8 +69,7 @@ async def health():
 async def cache_stats():
     """Snapshot of radix-cache effectiveness counters.
 
-    Returns ``{"enabled": False}`` if the engine doesn't have a radix
-    cache wired up yet — students see this until they implement Part B.
+    Returns ``{"enabled": False}`` if the radix prefix cache is disabled.
     """
     cache = getattr(engine, "radix_cache", None) if engine else None
     if cache is None:

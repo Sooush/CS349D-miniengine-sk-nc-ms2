@@ -63,13 +63,9 @@ class MatchResult:
 class RadixCache:
     """Token-prefix → KV-pages cache backed by a radix tree.
 
-    Required behaviours (see milestone 3 doc):
-      * page-aligned matching — never return a partial-page result
-      * LRU eviction of unlocked subtrees
-      * eviction-on-allocate: ``KVMemoryPool.allocate`` should call
-        ``cache.evict(n)`` when the free list is short
-      * ``inc_lock_ref`` / ``dec_lock_ref`` protect in-flight requests
-        (same names as sglang's radix cache).
+    Prefix matching is page-aligned. Unlocked entries are LRU-evicted;
+    ``KVMemoryPool.allocate`` calls ``evict`` when the free list is short.
+    ``inc_lock_ref`` / ``dec_lock_ref`` pin nodes for in-flight requests.
     """
 
     def __init__(self, pool: "KVMemoryPool") -> None:
@@ -86,8 +82,6 @@ class RadixCache:
     def num_evictable_pages(self) -> int:
         """Pages that an LRU sweep could free right now."""
         return self._count_pages(self.root, locked=False)
-
-    # ── Lookup ─────────────────────────────────────────────────────────
 
     def match_prefix(self, tokens: list[int]) -> MatchResult:
         """Find the longest page-aligned prefix of ``tokens`` in the tree."""
@@ -157,7 +151,6 @@ class RadixCache:
         if aligned_len == 0:
             return self.root, list(pages)
 
-        # ── Eviction ───────────────────────────────────────────────────────
         tokens = tokens[:aligned_len]
         num_pages = aligned_len // self.page_size
         if len(pages) < num_pages:

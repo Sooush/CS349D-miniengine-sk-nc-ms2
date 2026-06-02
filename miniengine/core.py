@@ -60,17 +60,11 @@ class Request:
     # Streaming output channel — scheduler pushes, server consumes
     token_queue: queue.Queue = field(default_factory=queue.Queue)
 
-    # ── Milestone 3 perf counters (set by scheduler; read by server) ───
-    # Number of prompt tokens served from the radix prefix cache.  Stays
-    # 0 when the cache is disabled or the lookup missed.  Surfaced in
-    # the response's ``usage`` block so clients can record per-request
-    # cache effectiveness.
+    # Prompt tokens served from the radix prefix cache (page-aligned).
     cache_hit_tokens: int = 0
 
     prefill_offset: int = 0
     radix_lock_node: Any = None
-
-    # ── Derived properties ─────────────────────────────────────────────
 
     @property
     def num_input_tokens(self) -> int:
@@ -86,7 +80,7 @@ class Request:
 
     @property
     def prefill_done(self) -> bool:
-        """M3: True once every prompt token is in KV."""
+        """True once every prompt token is stored in KV."""
         return self.prefill_offset >= self.num_input_tokens
 
 

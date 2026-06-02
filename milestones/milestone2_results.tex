@@ -11,19 +11,32 @@
 
 \captionsetup{font=small, labelfont=bf}
 
-\title{MiniEngine Milestone 2 --- Benchmark Results}
-\author{}
-\date{}
+\title{Milestone 2}
+\author{Sarosh Khan and Naomi Chien}
+\date{5/8/2026}
 
 \begin{document}
 \maketitle
 
-\noindent\textbf{Environment (fill in if needed.)}
-Model: \texttt{Qwen/Qwen3-8B}; GPU: L4 (per course instructions).
-Unless noted, paged runs use \texttt{--mem-fraction-static 0.85}.
+\noindent\textbf{Environment.}
+Model: \texttt{Qwen/Qwen3-8B};\\
+GPU: NVIDIA L4;\\
+Paged runs reserve KV memory with \texttt{--mem-fraction-static 0.85} unless noted.
 
 % ---------------------------------------------------------------------------
-\section{Accuracy (\texttt{bench\_accuracy} / MMLU)}
+\section{Design and implementation}
+
+Milestone~1 decoded with \texttt{torch.cat}-grown KV caches, which reallocates, fragments GPU memory, and breaks pointer stability under load.
+We replace that with a fixed-budget pool (\texttt{KVMemoryPool}): page-major \(K,V\) tensors per layer, a free-list of physical pages, per-request page tables (\texttt{PagedRequestState}), and admission via peak token count (\texttt{paged\_kv\_can\_admit}); \texttt{from\_budget} sizes the pool from a VRAM fraction.
+Prefill is packed varlen (\texttt{flash\_attn\_varlen\_func}); decode indexes the pool via \texttt{flash\_attn\_with\_kvcache} and \texttt{block\_table} when \texttt{page\_size} is divisible by~256---otherwise pooled KV may be gathered in \texttt{\_build\_batched\_kv\_from\_pool}.
+\texttt{Attention.forward} selects among these branches (else SDPA plus the legacy cache path).
+
+For launch overhead we \texttt{torch.compile} each layer's SwiGLU \texttt{mlp} (\texttt{mode=reduce-overhead}, CLI \texttt{--torch-compile}) with synthetic batch warmup (and CUDA-graph step markers when available).
+
+% ---------------------------------------------------------------------------
+\section{Experiments}
+
+\subsection{Accuracy (MMLU)}
 
 \noindent Commands:
 \begin{verbatim}
@@ -40,6 +53,7 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
 \begin{table}[htbp]
   \centering
   \caption{MMLU accuracy (100 samples).}
+  \label{tab:mmlu}
   \begin{tabular}{@{}lccc@{}}
     \toprule
     Configuration & Accuracy & Correct / Samples & Avg latency \\
@@ -52,7 +66,9 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
 \end{table}
 
 % ---------------------------------------------------------------------------
-\section{Throughput: batched baseline vs.\ paged}
+\subsection{Throughput: batched baseline vs.\ paged}
+
+\noindent We sweep concurrency at fixed prompt/generation lengths. We report time-to-first-token (TTFT), end-to-end completion time, time per output token (TPOT), and aggregate generation throughput (GenTok/s).
 
 \noindent Benchmark:
 \begin{verbatim}
@@ -74,6 +90,7 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
 \begin{table}[htbp]
   \centering
   \caption{Batched vs.\ paged \texttt{bench\_serving} (512 input / 256 output tokens). TTFT and completion in ms; TPOT in ms/token.}
+  \label{tab:batched-paged}
   \resizebox{\textwidth}{!}{%
   \begin{tabular}{@{}rcccccccc@{}}
     \toprule
@@ -98,7 +115,9 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
 \end{table}
 
 % ---------------------------------------------------------------------------
-\section{Throughput: paged vs.\ paged + \texttt{torch.compile}}
+\subsection{Throughput: paged vs.\ paged + \texttt{torch.compile}}
+
+\noindent Same serving benchmark, but with randomized prompts and fixed request count to better expose steady-state decode overhead. We compare paged eager vs.\ paged with compiled MLP submodules.
 
 \noindent Benchmark:
 \begin{verbatim}
@@ -122,6 +141,7 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
 \begin{table}[htbp]
   \centering
   \caption{Effect of \texttt{torch.compile} (MLP target) on paged serving.}
+  \label{tab:compile}
   \resizebox{\textwidth}{!}{%
   \begin{tabular}{@{}rcccccccc@{}}
     \toprule
@@ -142,7 +162,9 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
 \end{table}
 
 % ---------------------------------------------------------------------------
-\section{Page-size comparison}
+\subsection{Page-size comparison}
+
+\noindent Same workload as the compile comparison, varying only the KV page size. Smaller pages reduce tail fragmentation; larger pages reduce page-table indirection.
 
 \noindent Benchmark (same as previous section):
 \begin{verbatim}
@@ -162,6 +184,7 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
 \begin{table}[htbp]
   \centering
   \caption{\texttt{bench\_serving} for two KV page sizes.}
+  \label{tab:pagesize}
   \resizebox{\textwidth}{!}{%
   \begin{tabular}{@{}rcccccccc@{}}
     \toprule
@@ -181,8 +204,19 @@ python -m miniengine --model Qwen/Qwen3-8B --mode paged \
   }
 \end{table}
 
-\paragraph{Comment.}
-Smaller pages (256) reduce wasted KV capacity at sequence tails but grow page-table metadata and indexing work; larger pages (1024) do the opposite.
-In this sweep, aggregate generation throughput (\textbf{GenTok/s}) is nearly identical at concurrency~8 (90 vs.\ 90); at concurrency~16 and~32, \textbf{page-size 256} yields higher throughput (136 vs.\ 131; 134 vs.\ 130), while \textbf{1024} shows lower median completion time at several points (e.g.\ Compl$_{p50}$ at conc.\ 8 and~32), reflecting a tradeoff between tail latency and sustained tokens/sec rather than a single ``always better'' setting.
+% ---------------------------------------------------------------------------
+\section{Sources of performance benefits and analysis}
+
+\paragraph{Batched baseline vs.\ paged (Table~\ref{tab:batched-paged}).}
+The primary gain comes from avoiding dynamic KV growth via \texttt{torch.cat} during decode. With a paged pool, KV appends are implemented as indexed writes into pre-allocated pages, which reduces reallocations/fragmentation and keeps memory stable under high concurrency. Empirically this yields higher throughput (conc.\ 16: 68 \(\rightarrow\) 129 GenTok/s; conc.\ 32: 72 \(\rightarrow\) 151) and improved tail behavior (conc.\ 16 TPOT${}_{p99}$ \(\sim\)397 \(\rightarrow\) \(\sim\)113 ms/token). At low concurrency, TTFT differences are small and more sensitive to warmup and scheduling overheads.
+
+\paragraph{\texttt{torch.compile} on the MLP (Table~\ref{tab:compile}).}
+We compile only the per-layer MLP, since it is a stable region executed at every decode step. This primarily reduces kernel-launch overhead and provides a modest but consistent throughput increase at higher concurrency (conc.\ 16: 136 \(\rightarrow\) 150 GenTok/s; conc.\ 32: 134 \(\rightarrow\) 152). TPOT changes are small because attention remains a major component of per-token cost.
+
+\paragraph{Accuracy sweep (Table~\ref{tab:mmlu}).}
+On 100 MMLU samples, 59 vs.\ 60 correct is within expected sampling noise, so we do not interpret the difference as meaningful. The key result is that paging and \texttt{torch.compile} improve performance without an observable accuracy regression on this small check. Average latency per example improves (2.07 s \(\rightarrow\) 1.74 s \(\rightarrow\) 1.55 s), consistent with cheaper KV maintenance and reduced launch overhead.
+
+\paragraph{Page size 256 vs.\ 1024 (Table~\ref{tab:pagesize}).}
+GenTok/s is similar at conc.\ 8, while smaller pages are slightly faster at conc.\ 16/32; larger pages sometimes reduce median completion time. This matches the expected tradeoff: smaller pages reduce tail fragmentation at the cost of more bookkeeping, while larger pages reduce metadata/indirection overhead but may waste more KV at sequence tails.
 
 \end{document}

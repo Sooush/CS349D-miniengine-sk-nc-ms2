@@ -1,18 +1,11 @@
-"""Pre-allocated paged KV cache memory pool — Milestone 2, Part A.
+"""Pre-allocated paged KV cache memory pool.
 
-This is a SKELETON. Implement the methods below.
+The pool owns a fixed amount of GPU memory divided into equal-size pages.
+Each page holds KV state for ``page_size`` tokens at one layer. Requests
+acquire pages as their KV grows and return them on completion.
 
-The pool owns a fixed amount of GPU memory, divided into equal-size
-**pages**. Each page holds the KV state for `page_size` tokens for one
-layer. Requests acquire pages as their KV grows and return them when
-they finish; the cache itself never reallocates.
-
-Storage layout (page-major vs token-major, contiguous K+V vs separate,
-shape conventions, etc.) is YOUR design decision — pick something and
-document the tradeoffs.
-
-Storage layout: page-major per layer. Each of K and V is shaped as
-(num_pages, page_size, num_kv_heads, head_dim).
+Storage is page-major per layer: K and V are shaped
+``(num_pages, page_size, num_kv_heads, head_dim)``.
 """
 
 from __future__ import annotations
@@ -70,7 +63,7 @@ class KVMemoryPool:
         self._radix_cache = None
 
     def set_radix_cache(self, cache) -> None:
-        """M3: wire prefix cache so allocate() can LRU-evict before OOM."""
+        """Attach prefix cache so allocate() can LRU-evict before OOM."""
         self._radix_cache = cache
 
     def allocate(self, num_pages: int) -> list[int]:
@@ -104,7 +97,7 @@ class KVMemoryPool:
 
     @property
     def num_evictable(self) -> int:
-        """M3: pages the radix cache could evict (0 if cache disabled)."""
+        """Pages the radix cache could evict (0 if cache disabled)."""
         if self._radix_cache is None:
             return 0
         return self._radix_cache.num_evictable_pages()

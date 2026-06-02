@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 
 from miniengine.core import Request
 from miniengine.kv_memory_pool import KVMemoryPool
+from miniengine.hicache import HiRadixCache
 from miniengine.radix_cache import RadixCache
 from miniengine.model import (
     FLASH_ATTN_AVAILABLE,
@@ -68,6 +69,8 @@ class Engine:
        
         prefill_chunk_size: int = 0,
         disable_radix_cache: bool = False,
+        cpu_cache_size_gb: float = 0.0,
+        hicache_overlap: bool = False,
     ):
         self.device = device
         self.dtype = dtype
@@ -173,9 +176,16 @@ class Engine:
                 self.kv_pool.num_free,
             )
             if not disable_radix_cache:
-                self.radix_cache = RadixCache(self.kv_pool)
+                if cpu_cache_size_gb > 0:
+                    self.radix_cache = HiRadixCache(
+                        self.kv_pool,
+                        cpu_cache_size_gb=cpu_cache_size_gb,
+                        hicache_overlap=hicache_overlap,
+                    )
+                else:
+                    self.radix_cache = RadixCache(self.kv_pool)
                 self.kv_pool.set_radix_cache(self.radix_cache)
-                logger.info("Radix prefix cache enabled (milestone 3 Part B)")
+                logger.info("Radix prefix cache enabled")
             else:
                 logger.info("Radix prefix cache disabled")
 
@@ -345,8 +355,6 @@ class Engine:
         """Decode a single token id back to a string."""
         return self.tokenizer.decode([token_id], skip_special_tokens=True)
 
-    # ── Forward passes ──────────────────────────────────────────────────
-
     @torch.inference_mode()
     def prefill(self, request: Request) -> int:
         """
@@ -388,8 +396,8 @@ class Engine:
     def prefill_batch(self, requests: list[Request]) -> list[int | None]:
         """Prefill a batch of requests. Paged mode uses one model forward.
 
-        M3: returns one entry per request, ``None`` while chunked prefill is
-        still in progress, else the first sampled token id.
+        Returns one entry per request: ``None`` while chunked prefill is in
+        progress, otherwise the first sampled token id.
         """
         if not requests:
             return []
@@ -401,7 +409,7 @@ class Engine:
 
     @torch.inference_mode()
     def _prefill_batch_oneshot(self, requests: list[Request]) -> list[int]:
-        """M2 single-shot packed prefill; M3 radix skips cached prefix tokens."""
+        """Single-shot packed prefill; radix cache skips cached prefix tokens."""
         assert self.kv_pool is not None
         results: list[int | None] = [None] * len(requests)
         packed_reqs: list[Request] = []
@@ -428,7 +436,7 @@ class Engine:
 
     @torch.inference_mode()
     def _prefill_batch_chunked(self, requests: list[Request]) -> list[int | None]:
-        """M3 Part A: cap per-step q-tokens at ``prefill_chunk_size`` per request."""
+        """Cap per-step query tokens at ``prefill_chunk_size`` per request."""
         assert self.kv_pool is not None
         out: list[int | None] = [None] * len(requests)
         packed_reqs: list[tuple[int, Request]] = []
@@ -440,7 +448,6 @@ class Engine:
             if req.prefill_done:
                 out[i] = self._sample_first_token_cached_prompt(req)
             elif self._paged_state(req).kv_len > 0:
-                # M3: any KV in pool (radix hit or prior chunk) needs continuation.
                 cont_reqs.append((i, req))
             else:
                 packed_reqs.append((i, req))
@@ -549,7 +556,7 @@ class Engine:
 
     @torch.inference_mode()
     def _prefill_continuation_chunk(self, req: Request) -> int | None:
-        """M3: prefill next chunk when KV already lives in the pool."""
+        """Prefill the next chunk when KV already lives in the pool."""
         if req.prefill_done:
             return self._sample_first_token_cached_prompt(req)
 
@@ -595,7 +602,7 @@ class Engine:
         return None
 
     def _paged_prefill_init(self, req: Request) -> None:
-        """M3: radix lookup + page allocation before the first prefill chunk."""
+        """Radix lookup and page allocation before the first prefill chunk."""
         assert self.kv_pool is not None
         matched_pages: list[int] = []
         last_node = None
@@ -623,7 +630,7 @@ class Engine:
 
     @torch.inference_mode()
     def _sample_first_token_cached_prompt(self, req: Request) -> int:
-        """M3: prompt fully in KV (radix hit); logits from last prompt token only."""
+        """Sample first token when the full prompt is already in KV."""
         state = self._paged_state(req)
         state.kv_len = len(req.input_ids)
         req.prefill_offset = len(req.input_ids)
@@ -652,7 +659,7 @@ class Engine:
     def _build_continuation_attention_mask(
         self, cache_len: int, chunk_len: int
     ) -> torch.Tensor:
-        """M3: causal mask for new chunk attending to cached prefix + itself."""
+        """Causal mask for a new chunk attending to cached prefix and itself."""
         kv_len = cache_len + chunk_len
         mask = torch.full(
             (1, 1, chunk_len, kv_len),
@@ -958,7 +965,7 @@ class Engine:
     def _radix_cache_commit_request(
         self, request: Request, state: PagedRequestState
     ) -> None:
-        """M3: insert finished sequence into radix; release duplicate/extra pages."""
+        """Insert finished sequence into radix cache; release duplicate pages."""
         assert self.radix_cache is not None
         tokens = request.input_ids + request.output_ids
         committed_len = len(tokens)
