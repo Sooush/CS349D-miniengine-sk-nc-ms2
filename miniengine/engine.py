@@ -129,7 +129,9 @@ class Engine:
             elif self.page_size % 256 != 0:
                 logger.warning(
                     "flash-attn direct paged decode requires page_size divisible by 256; "
-                    "got page_size=%d. Falling back to non-direct decode path.",
+                    "got page_size=%d. Falling back to non-direct decode path "
+                    "(gathers full KV each token — very slow on long contexts; "
+                    "use --page-size 256 for production benchmarks).",
                     self.page_size,
                 )
             bytes_budget = kv_pool_bytes_budget
@@ -223,7 +225,12 @@ class Engine:
             return True
         total = sum(self.paged_peak_pages_for_request(r) for r in active)
         total += self.paged_peak_pages_for_request(candidate)
-        return total <= self.kv_pool.num_pages
+        if total > self.kv_pool.num_pages:
+            return False
+        # Peak-page accounting ignores radix sharing; also require allocatable pages.
+        candidate_peak = self.paged_peak_pages_for_request(candidate)
+        available = self.kv_pool.num_free + self.kv_pool.num_evictable
+        return available >= candidate_peak
 
     def _enable_torch_compile(self, target: str, dynamic: bool) -> None:
         """Compile selected stable submodules to reduce launch overhead."""
@@ -601,6 +608,23 @@ class Engine:
             )
         return None
 
+    def _rollback_paged_prefill_init(
+        self,
+        req: Request,
+        *,
+        new_pages: list[int],
+    ) -> None:
+        """Undo partial prefill setup after allocation or prefill failure."""
+        assert self.kv_pool is not None
+        if new_pages:
+            self.kv_pool.free(new_pages)
+        if self.radix_cache is not None and req.radix_lock_node is not None:
+            self.radix_cache.dec_lock_ref(req.radix_lock_node)
+        req.radix_lock_node = None
+        req.kv_cache = None
+        req.prefill_offset = 0
+        req.cache_hit_tokens = 0
+
     def _paged_prefill_init(self, req: Request) -> None:
         """Radix lookup and page allocation before the first prefill chunk."""
         assert self.kv_pool is not None
@@ -622,11 +646,17 @@ class Engine:
 
         peak_pages = self.paged_peak_pages_for_request(req)
         extra_pages = max(0, peak_pages - len(matched_pages))
-        new_pages = self.kv_pool.allocate(extra_pages) if extra_pages > 0 else []
-        req.kv_cache = PagedRequestState(
-            page_indices=matched_pages + new_pages,
-            kv_len=req.prefill_offset,
-        )
+        new_pages: list[int] = []
+        try:
+            if extra_pages > 0:
+                new_pages = self.kv_pool.allocate(extra_pages)
+            req.kv_cache = PagedRequestState(
+                page_indices=matched_pages + new_pages,
+                kv_len=req.prefill_offset,
+            )
+        except RuntimeError:
+            self._rollback_paged_prefill_init(req, new_pages=new_pages)
+            raise
 
     @torch.inference_mode()
     def _sample_first_token_cached_prompt(self, req: Request) -> int:

@@ -113,6 +113,7 @@ class Scheduler:
                 self.step()
             except Exception:
                 logger.exception("Scheduler step failed")
+                self._abort_inflight_requests()
 
     # ── Scheduling step ─────────────────────────────────────────────────
 
@@ -286,6 +287,13 @@ class Scheduler:
         req.token_queue.put(
             TokenOutput(token_id=token_id, token_text=text, finished=False)
         )
+
+    def _abort_inflight_requests(self) -> None:
+        """Unblock clients after a scheduler step failure (e.g. KV pool OOM)."""
+        finished: list[Request] = []
+        for req in list(self.prefilling) + list(self.running):
+            logger.error("Aborting request %s after scheduler failure", req.request_id)
+            self._finish_request(req, finished)
 
     def _finish_request(self, req: Request, finished_list: list[Request]) -> None:
         """Mark a request as finished and free its resources."""
