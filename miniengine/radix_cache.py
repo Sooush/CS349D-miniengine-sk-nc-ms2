@@ -112,6 +112,10 @@ class RadixCache:
                     break
                 matched_pages.extend(child.pages[: match_len // self.page_size])
                 idx += match_len
+                # Lock this partially matched child: the request borrows its
+                # pages, so it must be the returned node (an unlocked leaf
+                # could otherwise be evicted while the request is in flight).
+                node = child
                 break
 
             matched_pages.extend(child.pages)
@@ -314,7 +318,7 @@ def _make_child(
     key: list[int],
     pages: list[int],
 ) -> RadixNode:
-    child = RadixNode()
+    child = type(parent)()
     child.parent = parent
     child.key = key
     child.pages = pages
@@ -332,12 +336,17 @@ def _split_node(node: RadixNode, split_at: int, page_size: int) -> RadixNode:
     old_child_key = _child_key(node.key, page_size)
     split_pages = split_at // page_size
 
-    new_node = RadixNode()
+    # Match the concrete node type (HiRadixNode in HiCache trees) and inherit
+    # the split node's storage tier — the new parent holds the first pages of
+    # the same node, so it lives in the same tier.
+    new_node = type(node)()
     new_node.parent = parent
     new_node.key = node.key[:split_at]
     new_node.pages = node.pages[:split_pages]
     new_node.last_access = node.last_access
     new_node.ref_count = node.ref_count
+    if hasattr(node, "tier"):
+        new_node.tier = node.tier
 
     node.parent = new_node
     node.key = node.key[split_at:]

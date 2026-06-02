@@ -197,6 +197,11 @@ class HiRadixCache(RadixCache):
                 self._ensure_gpu_pages(child)
                 matched_pages.extend(child.pages[:n_pages])
                 idx += match_len
+                # The request borrows promoted pages from this partially
+                # matched child, so it must be the locked node — otherwise
+                # the child stays an unlocked leaf and a later allocate could
+                # demote/evict pages still in use.
+                node = child
                 break
 
             self._ensure_gpu_pages(child)
@@ -300,7 +305,12 @@ class HiRadixCache(RadixCache):
     def _promote_node(self, node: RadixNode) -> None:
         assert self.cpu_pool is not None
         cpu_pages = list(node.pages)
-        gpu_pages = self.pool.allocate(len(cpu_pages))
+
+        node.ref_count += 1
+        try:
+            gpu_pages = self.pool.allocate(len(cpu_pages))
+        finally:
+            node.ref_count -= 1
         self._copy_kv(cpu_pages, gpu_pages, src_is_cpu=True)
         self.cpu_pool.free(cpu_pages)
         node.pages = gpu_pages
@@ -310,15 +320,67 @@ class HiRadixCache(RadixCache):
         assert self.cpu_pool is not None
         if _node_tier(node) is CacheTier.CPU:
             return False
-        cpu_pages = self.cpu_pool.allocate(len(node.pages))
+        n = len(node.pages)
+        cpu_pages = self.cpu_pool.allocate(n)
         if not cpu_pages:
-            return False
+            # CPU tier is full — reclaim space by evicting LRU CPU entries.
+            self._evict_cpu_lru(n)
+            cpu_pages = self.cpu_pool.allocate(n)
+            if not cpu_pages:
+                return False
         gpu_pages = list(node.pages)
         self._copy_kv(gpu_pages, cpu_pages, src_is_cpu=False)
         self.pool.free(gpu_pages)
         node.pages = cpu_pages
         node.tier = CacheTier.CPU
         return True
+
+    def _evict_cpu_lru(self, n_pages_needed: int) -> int:
+        """Drop LRU CPU-resident entries entirely (no lower tier)."""
+        if self.cpu_pool is None or n_pages_needed <= 0:
+            return 0
+
+        leaves = self._collect_evictable_cpu_leaves()
+        heap: list[tuple[float, int, RadixNode]] = [
+            (leaf.last_access, id(leaf), leaf) for leaf in leaves
+        ]
+        heapq.heapify(heap)
+        freed = 0
+
+        while freed < n_pages_needed and heap:
+            _, _, node = heapq.heappop(heap)
+            if (
+                node.ref_count > 0
+                or node is self.root
+                or not node.pages
+                or _node_tier(node) is not CacheTier.CPU
+            ):
+                continue
+
+            parent = node.parent
+            if parent is None:
+                continue
+
+            child_key = _child_key(node.key, self.page_size)
+            if parent.children.get(child_key) is not node:
+                continue
+
+            n = len(node.pages)
+            self.cpu_pool.free(node.pages)
+            freed += n
+            self._cached_page_count -= n
+            del parent.children[child_key]
+
+            if (
+                parent is not self.root
+                and not parent.children
+                and parent.ref_count == 0
+                and parent.pages
+                and _node_tier(parent) is CacheTier.CPU
+            ):
+                heapq.heappush(heap, (parent.last_access, id(parent), parent))
+
+        return freed
 
     def _copy_kv(
         self,
@@ -358,6 +420,12 @@ class HiRadixCache(RadixCache):
                 stream.synchronize()
 
     def _collect_evictable_gpu_leaves(self) -> list[RadixNode]:
+        return self._collect_evictable_leaves_for_tier(CacheTier.GPU)
+
+    def _collect_evictable_cpu_leaves(self) -> list[RadixNode]:
+        return self._collect_evictable_leaves_for_tier(CacheTier.CPU)
+
+    def _collect_evictable_leaves_for_tier(self, tier: CacheTier) -> list[RadixNode]:
         leaves: list[RadixNode] = []
 
         def dfs(node: RadixNode) -> None:
@@ -366,7 +434,7 @@ class HiRadixCache(RadixCache):
                 and not node.children
                 and node.ref_count == 0
                 and node.pages
-                and _node_tier(node) is CacheTier.GPU
+                and _node_tier(node) is tier
             ):
                 leaves.append(node)
             for child in node.children.values():
