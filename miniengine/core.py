@@ -66,6 +66,10 @@ class Request:
     prefill_offset: int = 0
     radix_lock_node: Any = None
 
+    # Set by the engine when prefill-init hits KV-pool OOM: the scheduler
+    # retracts the request back to WAITING instead of aborting the batch.
+    needs_retract: bool = False
+
     @property
     def num_input_tokens(self) -> int:
         return len(self.input_ids)

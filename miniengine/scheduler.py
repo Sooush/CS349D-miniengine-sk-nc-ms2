@@ -71,6 +71,7 @@ class Scheduler:
 
         # Throttle KV-capacity warnings in paged mode.
         self._kv_admission_warn_time: float = 0.0
+        self._retract_warn_time: float = 0.0
 
     # ── Public API (thread-safe) ────────────────────────────────────────
 
@@ -182,7 +183,9 @@ class Scheduler:
         if self.running:
             token_ids = self.engine.batched_decode(self.running)
             still_running: list[Request] = []
-            for req, token_id in zip(self.running, token_ids):
+            # Snapshot: _finish_request() mutates self.running; zipping the live
+            # list would skip a request when an earlier one finishes.
+            for req, token_id in zip(list(self.running), token_ids):
                 req.output_ids.append(token_id)
                 self._stream_token(req, token_id)
                 if self._check_finished(req, token_id):
@@ -233,9 +236,23 @@ class Scheduler:
         if self.prefilling:
             token_ids = self.engine.prefill_batch(self.prefilling)
             still_prefilling: list[Request] = []
+            retracted: list[Request] = []
             batch_hits = 0
             batch_prompt = 0
-            for req, token_id in zip(self.prefilling, token_ids):
+            # Iterate a snapshot: _finish_request() removes finished requests
+            # from self.prefilling, and mutating the list we're zipping over
+            # would skip the element shifted into the freed slot — silently
+            # dropping a request (pages never freed, stream never closed).
+            for req, token_id in zip(list(self.prefilling), token_ids):
+                if req.needs_retract:
+                    # KV pool was exhausted at prefill-init; send this request
+                    # back to WAITING (front of queue) to retry once running
+                    # requests finish and free pages. Avoids the old behaviour
+                    # where one OOM aborted every in-flight request.
+                    req.needs_retract = False
+                    req.status = RequestStatus.WAITING
+                    retracted.append(req)
+                    continue
                 batch_prompt += req.num_input_tokens
                 batch_hits += req.cache_hit_tokens
                 if token_id is None:
@@ -248,6 +265,22 @@ class Scheduler:
                 else:
                     self.running.append(req)
             self.prefilling = still_prefilling
+            if retracted:
+                with self._lock:
+                    for req in reversed(retracted):
+                        self.waiting.appendleft(req)
+                now = time.time()
+                if now - self._retract_warn_time > 30.0:
+                    self._retract_warn_time = now
+                    logger.warning(
+                        "Retracted %d request(s) to WAITING under KV pressure "
+                        "(running=%d, prefilling=%d, waiting=%d). They will "
+                        "retry as pages free up.",
+                        len(retracted),
+                        len(self.running),
+                        len(self.prefilling),
+                        len(self.waiting),
+                    )
             if batch_prompt > 0:
                 logger.info(
                     "prefill batch  n=%d  cache_hit_tokens=%d/%d (%.1f%%)",
@@ -260,7 +293,9 @@ class Scheduler:
         if self.running:
             token_ids = self.engine.batched_decode(self.running)
             still_running: list[Request] = []
-            for req, token_id in zip(self.running, token_ids):
+            # Snapshot: _finish_request() mutates self.running; zipping the live
+            # list would skip a request when an earlier one finishes.
+            for req, token_id in zip(list(self.running), token_ids):
                 req.output_ids.append(token_id)
                 self._stream_token(req, token_id)
                 if self._check_finished(req, token_id):

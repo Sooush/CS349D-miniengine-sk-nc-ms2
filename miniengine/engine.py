@@ -415,7 +415,7 @@ class Engine:
         return self._prefill_batch_chunked(requests)
 
     @torch.inference_mode()
-    def _prefill_batch_oneshot(self, requests: list[Request]) -> list[int]:
+    def _prefill_batch_oneshot(self, requests: list[Request]) -> list[int | None]:
         """Single-shot packed prefill; radix cache skips cached prefix tokens."""
         assert self.kv_pool is not None
         results: list[int | None] = [None] * len(requests)
@@ -423,7 +423,12 @@ class Engine:
 
         for i, req in enumerate(requests):
             if req.kv_cache is None:
-                self._paged_prefill_init(req)
+                try:
+                    self._paged_prefill_init(req)
+                except RuntimeError:
+                    # KV pool exhausted: retract to WAITING (see chunked path).
+                    req.needs_retract = True
+                    continue
             if req.prefill_done:
                 results[i] = self._sample_first_token_cached_prompt(req)
             elif self._paged_state(req).kv_len > 0:
@@ -439,7 +444,7 @@ class Engine:
             for (i, _), tok in zip(packed_reqs, packed_results):
                 results[i] = tok
 
-        return [int(t) for t in results]
+        return [int(t) if t is not None else None for t in results]
 
     @torch.inference_mode()
     def _prefill_batch_chunked(self, requests: list[Request]) -> list[int | None]:
@@ -451,7 +456,15 @@ class Engine:
 
         for i, req in enumerate(requests):
             if req.kv_cache is None:
-                self._paged_prefill_init(req)
+                try:
+                    self._paged_prefill_init(req)
+                except RuntimeError:
+                    # KV pool exhausted. _paged_prefill_init already rolled back
+                    # (freed pages, released the prefix lock), so the request is
+                    # clean. Flag it for retraction to WAITING rather than
+                    # crashing the whole batch; it retries once pages free up.
+                    req.needs_retract = True
+                    continue
             if req.prefill_done:
                 out[i] = self._sample_first_token_cached_prompt(req)
             elif self._paged_state(req).kv_len > 0:

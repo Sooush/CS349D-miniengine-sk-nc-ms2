@@ -223,9 +223,16 @@ class HiRadixCache(RadixCache):
         if not self.hicache_enabled:
             return super().evict(n_pages_needed)
 
-        leaves = self._collect_evictable_gpu_leaves()
+        # Collect ALL unlocked GPU-tier nodes (internal nodes included), not
+        # just leaves. Demotion moves a node's pages GPU->CPU *without* removing
+        # it from the tree, so — unlike a drop — it does not require the node to
+        # be a leaf. Collecting only leaves left GPU internal nodes whose
+        # children had been demoted to CPU permanently stuck: they were counted
+        # by num_evictable_pages() (every unlocked GPU node) but could never be
+        # reclaimed, so admission over-admitted and allocate() then OOM'd.
+        nodes = self._collect_evictable_gpu_nodes()
         heap: list[tuple[float, int, RadixNode]] = [
-            (leaf.last_access, id(leaf), leaf) for leaf in leaves
+            (n.last_access, id(n), n) for n in nodes
         ]
         heapq.heapify(heap)
         freed = 0
@@ -240,35 +247,27 @@ class HiRadixCache(RadixCache):
             ):
                 continue
 
-            parent = node.parent
-            if parent is None:
-                continue
-
-            child_key = _child_key(node.key, self.page_size)
-            if parent.children.get(child_key) is not node:
-                continue
-
             n = len(node.pages)
             if self._demote_node(node):
                 freed += n
                 self.metrics.total_evicted_pages += n
                 continue
 
-            # CPU pool full — drop the subtree entry.
+            # CPU pool full and couldn't make room. Only a leaf can be dropped
+            # entirely (dropping an internal node would orphan its subtree).
+            if node.children:
+                continue
+            parent = node.parent
+            if parent is None:
+                continue
+            child_key = _child_key(node.key, self.page_size)
+            if parent.children.get(child_key) is not node:
+                continue
             self.pool.free(node.pages)
             freed += n
             self._cached_page_count -= n
             self.metrics.total_evicted_pages += n
             del parent.children[child_key]
-
-            if (
-                parent is not self.root
-                and not parent.children
-                and parent.ref_count == 0
-                and parent.pages
-                and _node_tier(parent) is CacheTier.GPU
-            ):
-                heapq.heappush(heap, (parent.last_access, id(parent), parent))
 
         return freed
 
@@ -418,6 +417,28 @@ class HiRadixCache(RadixCache):
                 ctx.__exit__(None, None, None)
             if stream is not None:
                 stream.synchronize()
+
+    def _collect_evictable_gpu_nodes(self) -> list[RadixNode]:
+        """All unlocked GPU-tier nodes (internal + leaf).
+
+        A node with ``ref_count == 0`` has no locked descendant (``inc_lock_ref``
+        walks to the root), so it is safe to demote regardless of its children.
+        """
+        nodes: list[RadixNode] = []
+
+        def dfs(node: RadixNode) -> None:
+            if (
+                node is not self.root
+                and node.ref_count == 0
+                and node.pages
+                and _node_tier(node) is CacheTier.GPU
+            ):
+                nodes.append(node)
+            for child in node.children.values():
+                dfs(child)
+
+        dfs(self.root)
+        return nodes
 
     def _collect_evictable_gpu_leaves(self) -> list[RadixNode]:
         return self._collect_evictable_leaves_for_tier(CacheTier.GPU)
