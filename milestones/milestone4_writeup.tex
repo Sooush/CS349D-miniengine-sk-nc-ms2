@@ -1,0 +1,179 @@
+% Milestone 4 (Track 1: HiCache) report — paste into a larger report or compile standalone.
+% Build: pdflatex milestone4_results.tex
+% NOTE: numbers tagged with TODO are placeholders — fill in once benchmarks run.
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage{xcolor}
+
+\captionsetup{font=small, labelfont=bf}
+
+% Lightweight marker for unfilled numbers; remove \showtodos to hide.
+\newcommand{\showtodos}{}
+\newcommand{\todo}[1]{\ifdefined\showtodos\textcolor{red}{[TODO: #1]}\else#1\fi}
+
+\title{Milestone 4: Hierarchical KV Cache (GPU + CPU)}
+\author{Sarosh Khan and Naomie Chien}
+\date{6/2/2026}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{Environment.}
+Model: \texttt{Qwen/Qwen3-8B};\\
+GPU: NVIDIA L4;\\
+All paged runs use \texttt{--page-size 32 --prefill-chunk-size 512}. To expose the GPU capacity wall cleanly, the cliff/restore demo pins the GPU KV pool at a fixed \textbf{64 pages} (\texttt{--fixed-kv-pool-pages --kv-pool-pages 64}, i.e. $64\times32=2048$ token-slots) rather than sizing it from a VRAM fraction, so the only variable between the two runs is \texttt{--cpu-cache-size-gb}.\\
+Baseline is the \textbf{milestone-3 default} (chunked prefill + GPU-only radix cache); HiCache layers on top of it.
+
+% ===========================================================================
+\section{Design and Implementation}
+
+We chose \textbf{Track 1 (HiCache)}: extend the milestone-3 radix prefix cache with a CPU-memory KV tier underneath HBM. The milestone-3 cache lives entirely in GPU HBM, so once the KV pool fills, LRU eviction frees cached pages back to the free list and the prefix is gone and the next request that would have hit must re-prefill from scratch. HiCache demotes evicted GPU pages into a pre-allocated pinned-host pool instead of dropping them, and re-promotes them (H2D copy) on a later hit, so the effective cache capacity grows by the DRAM:HBM ratio.
+
+\paragraph{Per-node tier tracking.}
+\texttt{HiRadixNode} extends \texttt{RadixNode} with a single \texttt{tier} field (\texttt{CacheTier.GPU} or \texttt{CacheTier.CPU}) recording where that node's KV pages physically live. A free helper \texttt{\_node\_tier} defaults legacy nodes to GPU, so the tree stays correct even where plain \texttt{RadixNode}s appear.
+
+\paragraph{CPU pool.}
+\texttt{CPUKVPool} is a pinned-memory mirror of \texttt{KVMemoryPool}: per-layer $K$ and $V$ tensors of shape \texttt{(num\_cpu\_pages, page\_size, num\_kv\_heads, head\_dim)}, allocated once at startup with \texttt{pin\_memory=True} (required for async H2D), and a free-list of page indices. \texttt{from\_gib} sizes the pool from the \texttt{--cpu-cache-size-gb} budget by dividing the byte budget by the per-page-across-all-layers cost.
+
+\paragraph{Demote on GPU eviction.}
+As described in implementation details in the MD, \texttt{HiRadixCache.evict} overrides the base LRU eviction. It collects unlocked GPU-resident leaves, heap-orders them by \texttt{last\_access}, and for each victim calls \texttt{\_demote\_node}: allocate CPU pages, copy the KV \textbf{D2H}, free the GPU pages back to \texttt{KVMemoryPool}, and repoint the node at the CPU tier. The pages are reclaimed for the GPU free list but the cached prefix survives in DRAM. If the CPU pool is full, \texttt{\_demote\_node} returns \texttt{False} and the node is dropped entirely (no lower tier), matching milestone-3 behavior as a fallback.
+
+\paragraph{Promote on hit.}
+\texttt{match\_prefix} walks the tree as in milestone 3, but every matched node is passed through \texttt{\_ensure\_gpu\_pages}: if the node is CPU-resident it triggers \texttt{\_promote\_node}, which allocates fresh GPU pages, copies \textbf{H2D} from the CPU pool, frees the CPU slots, and flips the tier back to GPU. The request then proceeds exactly as a normal GPU-cache hit --- the rest of the engine never sees the tiering.
+
+\section{Correctness}
+
+The end-to-end correctness criterion is that the restore run produces real (non-empty) completions and the workload finishes with no hang and no OOM in either tier. Bringing HiCache up under the stress configuration (small GPU pool, concurrency 8) surfaced two latent engine bugs that we had to fix to satisfy this; both are interesting because neither is a HiCache logic error per se.
+
+\paragraph{(1) Eviction accounting vs.\ mechanism mismatch (HiCache).}
+\texttt{num\_evictable\_pages()} counts \emph{every} unlocked GPU-tier node (internal and leaf), but \texttt{HiRadixCache.evict} originally collected only \emph{leaf} GPU nodes. A GPU-tier internal node whose children had been demoted to CPU is never a leaf, and the childless-cascade only fires when a node is \emph{dropped} (demotion does not remove nodes). Such nodes were therefore counted as evictable but never reclaimable: they accumulated until the GPU pool wedged. Because admission (\texttt{paged\_kv\_can\_admit}) trusts \texttt{free + num\_evictable}, it would admit a request that \texttt{allocate()} then could not satisfy, raising \texttt{KV pool OOM}. \textbf{Fix:} eviction now collects all unlocked GPU nodes and \emph{demotes} them (internal nodes included --- demotion moves pages D2H without removing the node, so leaf-ness is not required); dropping still requires a leaf. This makes \texttt{evict} able to reclaim everything the accounting promises, so admission is consistent.
+
+\paragraph{(2) Request dropped by mid-iteration list mutation (scheduler).}
+The paged scheduler stepped with \texttt{for req, tok in zip(self.running, token\_ids)} while \texttt{\_finish\_request} removed the finishing request from \texttt{self.running}. Mutating a list mid-iteration makes \texttt{zip} skip the element shifted into the freed slot; the skipped request was never re-queued, so its pages were never freed and its stream never closed --- the client blocked forever. This fired constantly because many turns end on an immediate stop token (an early finish sharing a batch with other in-flight requests), and manifested as the run stalling partway (e.g.\ \texttt{Enqueued}~$=$~84 but \texttt{Finished}~$=$~77, engine idle, GPU 0\%). \textbf{Fix:} iterate over a snapshot (\texttt{zip(list(self.running), token\_ids)}) in both the prefill and decode loops.
+
+With both fixes, the stress configuration (concurrency 8, 64-page pool) runs to completion with zero aborts and zero dropped requests in both the GPU-only and HiCache configurations.
+
+\section{Quantitative Evaluation}
+
+We use \texttt{bench\_cache.py --workload multiturn} as the main benchmark harness, the workload that most cleanly stresses cache distance. The required full-credit result is two parts: (1) demonstrate the GPU-only hit-rate cliff, and (2) show HiCache restores the per-turn hit rate with no collapse.
+
+\subsection{Part 1: The GPU-only cliff (HiCache off)}
+\label{sec:cliff}
+
+With HiCache off (milestone-3 baseline), the 64-page GPU pool (2048 token-slots) is far smaller than the working set of 16 interleaved sessions whose prompts grow each turn. Running them at concurrency 8 means a session's previously-cached prefix is LRU-evicted by the other sessions before that session's next turn reuses it, so early turns hit but late turns collapse.
+
+\begin{verbatim}
+python3 -m miniengine --model Qwen/Qwen3-8B --mode paged \
+    --page-size 32 --prefill-chunk-size 512 \
+    --fixed-kv-pool-pages --kv-pool-pages 64 --cpu-cache-size-gb 0
+
+python3 -u -m benchmark.bench_cache --workload multiturn \
+    --num-sessions 16 --turns-per-session 8 \
+    --max-tokens 64 --concurrency 8 --base-url http://localhost:8000
+\end{verbatim}
+
+\noindent GPU KV pool: \texttt{pool\_pages=64} ($=2048$ token-slots at \texttt{page-size 32}). The per-turn breakdown (Table~\ref{tab:cliff}) shows the cliff: the hit rate never recovers past the first couple of turns and TTFT balloons (to $>$11\,s at p50 on turn 7) as the engine re-prefills evicted history. Aggregate cache hit rate is \textbf{8.1\%}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Per-turn breakdown, GPU-only (HiCache off), 64-page pool.}
+  \label{tab:cliff}
+  \begin{tabular}{@{}rrrr@{}}
+    \toprule
+    Turn & Prompt tok & Hit tok & Hit rate \\
+    \midrule
+    0 & 2286 &    0 &  0.0\% \\
+    1 & 3108 &  768 & 24.7\% \\
+    2 & 4015 &  768 & 19.1\% \\
+    3 & 4935 &    0 &  0.0\% \\
+    4 & 5899 &  384 &  6.5\% \\
+    5 & 6983 &  448 &  6.4\% \\
+    6 & 7983 &  224 &  2.8\% \\
+    7 & 9219 &  992 & 10.8\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Part 2: HiCache restores the hit rate}
+\label{sec:restore}
+
+Identical workload and GPU pool, HiCache enabled with an 8\,GiB CPU pool (\texttt{cpu\_pages=1820}, $\approx 28\times$ the 64-page GPU pool, well past the $\ge 10\times$ bar).
+
+\begin{verbatim}
+python3 -m miniengine --model Qwen/Qwen3-8B --mode paged \
+    --page-size 32 --prefill-chunk-size 512 \
+    --fixed-kv-pool-pages --kv-pool-pages 64 --cpu-cache-size-gb 8
+
+python3 -u -m benchmark.bench_cache --workload multiturn \
+    --num-sessions 16 --turns-per-session 8 \
+    --max-tokens 64 --concurrency 8 --base-url http://localhost:8000
+\end{verbatim}
+
+\noindent With the CPU tier absorbing evicted prefixes and re-promoting them on hit, the per-turn hit rate \emph{stays high across all turns} (Table~\ref{tab:restore}): instead of collapsing it climbs to $\approx$88\% and holds. Aggregate cache hit rate is \textbf{76.4\%} --- a $9.4\times$ improvement over the GPU-only baseline at the same GPU capacity.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Per-turn breakdown, HiCache on (8\,GiB CPU tier), same 64-page GPU pool.}
+  \label{tab:restore}
+  \begin{tabular}{@{}rrrr@{}}
+    \toprule
+    Turn & Prompt tok & Hit tok & Hit rate \\
+    \midrule
+    0 & 2279 &    0 &  0.0\% \\
+    1 & 3235 & 2048 & 63.3\% \\
+    2 & 4043 & 2848 & 70.4\% \\
+    3 & 4410 & 3776 & 85.6\% \\
+    4 & 4900 & 4064 & 82.9\% \\
+    5 & 5421 & 4576 & 84.4\% \\
+    6 & 5895 & 5024 & 85.2\% \\
+    7 & 6384 & 5600 & 87.7\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Part 3: End-to-end completion and performance}
+
+Both configurations complete all 128 requests with no hang and no OOM in either tier (0 aborts, 0 dropped requests). Beyond restoring the hit rate, HiCache also \emph{wins on wall-clock and latency} here, because avoiding re-prefill of evicted history (a D2H/H2D page copy is far cheaper than recomputing attention over hundreds of tokens) more than pays for the copy traffic.
+
+\begin{table}[htbp]
+  \centering
+  \caption{End-to-end comparison at the same 64-page GPU pool (multiturn 16$\times$8, concurrency 8).}
+  \label{tab:e2e}
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    Metric & GPU-only & HiCache & $\Delta$ \\
+    \midrule
+    Requests completed & 128/128 & 128/128 & --- \\
+    Cache hit rate     & 8.1\%   & 76.4\%  & $9.4\times$ \\
+    Wall time          & 194.9 s & 107.0 s & $-45\%$ \\
+    Throughput         & 0.66 req/s & 1.20 req/s & $+82\%$ \\
+    TTFT p50 / p99 (ms)& 2656 / 23081 & 2936 / 9898 & p99 $-57\%$ \\
+    Latency p50 / p99 (ms)& 8569 / 29640 & 4954 / 18488 & p50 $-42\%$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Analysis.}
+Three things stand out. (i) The cliff is a \emph{capacity} effect, not a \emph{tier-logic} effect: at a larger pool (\texttt{pool\_pages=128}) the same workload does not collapse because the interleaved working set fits in HBM; the 64-page pool is what makes the DRAM:HBM capacity ratio matter, exactly as HiCache is designed to exploit. (ii) The restore is near-flat after turn~2 ($\approx$83--88\%), confirming the CPU tier is large enough that demoted prefixes survive until reused --- promotion is recovering essentially all of the page-aligned prefix that the GPU-only run lost. (iii) The latency tail is where the win is sharpest: GPU-only TTFT p99 of 23\,s reflects requests stuck behind full re-prefills of multi-hundred-token histories, which HiCache cuts to 9.9\,s.
+
+\section{Extra Credit}
+
+The milestone offers bonus credit for a \textbf{real end-to-end win}: $>20\%$ throughput \emph{or} $>20\%$ TTFT improvement on a multiturn configuration vs.\ the milestone-3 default. At the 64-page pool (Table~\ref{tab:e2e}) HiCache delivers \textbf{both} comfortably: \textbf{+82\% throughput} (0.66~$\to$~1.20 req/s, equivalently $-45\%$ wall time) and \textbf{$-57\%$ TTFT p99} (23.1~$\to$~9.9~s), with end-to-end latency p50 down 42\%. The win comes from replacing full re-prefill of evicted conversation history with a comparatively cheap H2D page copy, so the saving grows with prefix length --- precisely the long-horizon multiturn regime. (We implemented the blocking-copy path; the \texttt{--hicache-overlap} async-stream path is wired through the CLI but the overlap was not separately profiled here.)
+
+\section{What Didn't Work / Limitations}
+
+\begin{itemize}
+  \item \textbf{Gen-tok/s is slightly lower for HiCache} (27 vs.\ 33): with fewer re-prefills the run is dominated by genuine decode rather than redundant prefill compute, so raw generated-token throughput per second drops even as \emph{request} throughput rises sharply. Request throughput / latency are the meaningful metrics for this workload.
+  \item Per-page \texttt{copy\_} loop in \texttt{\_copy\_kv} issues one copy per (layer, page); batching the page dimension into a single gather would cut copy-launch overhead.
+  \item CPU-tier overflow currently drops the GPU victim rather than evicting LRU within the CPU pool --- not exercised here since the 8\,GiB CPU pool never saturated, but it would bound hit rate once the conversation corpus exceeds DRAM.
+  \item Blocking copies (default) serialize demote/promote with model execution; \texttt{--hicache-overlap} is implemented but its overlap ratio was not separately measured.
+  \item The GPU-only cliff here starts the collapse early (turn~1 is already $\approx$25\%, not $\ge$70\%) because the 64-page pool is small enough to thrash from the first reuse; a slightly larger pool would give the textbook ``high-early, collapse-late'' shape, but the GPU-only-vs-HiCache contrast (8.1\% vs.\ 76.4\%) is already decisive.
+\end{itemize}
+
+\end{document}
